@@ -628,3 +628,332 @@ UTEST_I(XdbTestRows, idx_composite_query, 2)
 	pRes = xdb_exec (pConn, "SELECT * FROM student WHERE name='jack' AND age=11");
 	CHECK_QUERY (pRes, 2, ASSERT_STREQ(stu.name, "jack"); ASSERT_EQ(stu.age, 11));
 }
+
+UTEST_I(XdbTest, join_two_tables, 2)
+{
+	xdb_res_t *pRes;
+	xdb_row_t *pRow;
+	xdb_conn_t *pConn = utest_fixture->pConn;
+
+	pRes = xdb_exec (pConn, "CREATE TABLE dept (id INT PRIMARY KEY, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "CREATE TABLE emp (id INT PRIMARY KEY, dept_id INT, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+
+	pRes = xdb_exec (pConn, "INSERT INTO dept VALUES (1,100),(2,200)");
+	CHECK_AFFECT (pRes, 2);
+	pRes = xdb_exec (pConn, "INSERT INTO emp VALUES (1,1,11),(2,1,22),(3,2,33)");
+	CHECK_AFFECT (pRes, 3);
+
+	pRes = xdb_exec (pConn, "SELECT * FROM dept JOIN emp ON dept.id = emp.dept_id");
+	ASSERT_EQ_MSG (xdb_errcode(pRes), XDB_OK, xdb_errmsg(pRes));
+	ASSERT_EQ (xdb_row_count(pRes), 3);
+	int sum_dept_val = 0, sum_emp_val = 0;
+	int count = 0;
+	while ((pRow = xdb_fetch_row (pRes)) != NULL) {
+		sum_dept_val += xdb_column_int (pRes, pRow, 1);
+		sum_emp_val  += xdb_column_int (pRes, pRow, 4);
+		count++;
+	}
+	ASSERT_EQ (count, 3);
+	ASSERT_EQ (sum_dept_val, 100+100+200); // dept 1 joined twice, dept 2 once
+	ASSERT_EQ (sum_emp_val, 11+22+33);
+	xdb_free_result (pRes);
+
+	// no matching rows
+	pRes = xdb_exec (pConn, "DELETE FROM emp");
+	CHECK_AFFECT (pRes, 3);
+	pRes = xdb_exec (pConn, "SELECT * FROM dept JOIN emp ON dept.id = emp.dept_id");
+	ASSERT_EQ_MSG (xdb_errcode(pRes), XDB_OK, xdb_errmsg(pRes));
+	ASSERT_EQ (xdb_row_count(pRes), 0);
+	xdb_free_result (pRes);
+
+	pRes = xdb_exec (pConn, "DROP TABLE emp");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "DROP TABLE dept");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+}
+
+UTEST_I(XdbTest, join_three_tables, 2)
+{
+	xdb_res_t *pRes;
+	xdb_row_t *pRow;
+	xdb_conn_t *pConn = utest_fixture->pConn;
+
+	pRes = xdb_exec (pConn, "CREATE TABLE ta (id INT PRIMARY KEY, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "CREATE TABLE tb (id INT PRIMARY KEY, aid INT, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "CREATE TABLE tc (id INT PRIMARY KEY, bid INT, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+
+	pRes = xdb_exec (pConn, "INSERT INTO ta VALUES (1,100),(2,200)");
+	CHECK_AFFECT (pRes, 2);
+	pRes = xdb_exec (pConn, "INSERT INTO tb VALUES (1,1,11),(2,2,22)");
+	CHECK_AFFECT (pRes, 2);
+	pRes = xdb_exec (pConn, "INSERT INTO tc VALUES (1,1,111),(2,1,222),(3,2,333)");
+	CHECK_AFFECT (pRes, 3);
+
+	pRes = xdb_exec (pConn, "SELECT * FROM ta JOIN tb ON ta.id = tb.aid JOIN tc ON tb.id = tc.bid");
+	ASSERT_EQ_MSG (xdb_errcode(pRes), XDB_OK, xdb_errmsg(pRes));
+	ASSERT_EQ (xdb_row_count(pRes), 3);
+	int count = 0;
+	while ((pRow = xdb_fetch_row (pRes)) != NULL) {
+		int a_val = xdb_column_int (pRes, pRow, 1);
+		int b_id  = xdb_column_int (pRes, pRow, 2);
+		int b_aid = xdb_column_int (pRes, pRow, 3);
+		int c_bid = xdb_column_int (pRes, pRow, 6);
+		ASSERT_EQ (b_aid, (a_val == 100) ? 1 : 2);
+		ASSERT_EQ (c_bid, b_id);
+		count++;
+	}
+	ASSERT_EQ (count, 3);
+	xdb_free_result (pRes);
+
+	pRes = xdb_exec (pConn, "DROP TABLE tc");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "DROP TABLE tb");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "DROP TABLE ta");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+}
+
+UTEST_I(XdbTest, join_varchar_unsupported, 2)
+{
+	xdb_res_t *pRes;
+	xdb_conn_t *pConn = utest_fixture->pConn;
+
+	pRes = xdb_exec (pConn, "CREATE TABLE jt1 (id INT PRIMARY KEY, name VARCHAR(32))");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "CREATE TABLE jt2 (id INT PRIMARY KEY, t1id INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+
+	// JOIN with a VARCHAR column must fail cleanly (not crash) until supported
+	pRes = xdb_exec (pConn, "SELECT * FROM jt1 JOIN jt2 ON jt1.id = jt2.t1id");
+	ASSERT_NE (xdb_errcode(pRes), XDB_OK);
+
+	pRes = xdb_exec (pConn, "DROP TABLE jt2");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "DROP TABLE jt1");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+}
+
+UTEST_I(XdbTest, join_table_alias, 2)
+{
+	xdb_res_t *pRes;
+	xdb_row_t *pRow;
+	xdb_conn_t *pConn = utest_fixture->pConn;
+
+	pRes = xdb_exec (pConn, "CREATE TABLE dept (id INT PRIMARY KEY, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "CREATE TABLE emp (id INT PRIMARY KEY, dept_id INT, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+
+	pRes = xdb_exec (pConn, "INSERT INTO dept VALUES (1,100),(2,200)");
+	CHECK_AFFECT (pRes, 2);
+	pRes = xdb_exec (pConn, "INSERT INTO emp VALUES (1,1,11),(2,1,22),(3,2,33)");
+	CHECK_AFFECT (pRes, 3);
+
+	// JOIN using aliases
+	pRes = xdb_exec (pConn, "SELECT * FROM dept AS d JOIN emp AS e ON d.id = e.dept_id");
+	ASSERT_EQ_MSG (xdb_errcode(pRes), XDB_OK, xdb_errmsg(pRes));
+	ASSERT_EQ (xdb_row_count(pRes), 3);
+	xdb_free_result (pRes);
+
+	// WHERE filtering on an aliased table
+	pRes = xdb_exec (pConn, "SELECT * FROM dept AS d JOIN emp AS e ON d.id = e.dept_id WHERE e.val > 20");
+	ASSERT_EQ_MSG (xdb_errcode(pRes), XDB_OK, xdb_errmsg(pRes));
+	ASSERT_EQ (xdb_row_count(pRes), 2);
+	while ((pRow = xdb_fetch_row (pRes)) != NULL) {
+		ASSERT_TRUE (xdb_column_int (pRes, pRow, 4) > 20);
+	}
+	xdb_free_result (pRes);
+
+	// once aliased, the real table name must no longer resolve
+	pRes = xdb_exec (pConn, "SELECT * FROM dept AS d JOIN emp AS e ON dept.id = e.dept_id");
+	ASSERT_NE (xdb_errcode(pRes), XDB_OK);
+
+	pRes = xdb_exec (pConn, "DROP TABLE emp");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "DROP TABLE dept");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+}
+
+UTEST_I(XdbTest, join_self, 2)
+{
+	xdb_res_t *pRes;
+	xdb_row_t *pRow;
+	xdb_conn_t *pConn = utest_fixture->pConn;
+
+	pRes = xdb_exec (pConn, "CREATE TABLE emp (id INT PRIMARY KEY, mgr_id INT, salary INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+
+	// id=1 is the top manager (mgr_id=0, no manager row matches it)
+	pRes = xdb_exec (pConn, "INSERT INTO emp VALUES (1,0,1000),(2,1,800),(3,1,850),(4,2,600)");
+	CHECK_AFFECT (pRes, 4);
+
+	// self-join: each employee with their manager's row
+	pRes = xdb_exec (pConn, "SELECT * FROM emp AS e JOIN emp AS m ON e.mgr_id = m.id");
+	ASSERT_EQ_MSG (xdb_errcode(pRes), XDB_OK, xdb_errmsg(pRes));
+	ASSERT_EQ (xdb_row_count(pRes), 3); // id=1 has no matching manager row, excluded
+	int count = 0;
+	while ((pRow = xdb_fetch_row (pRes)) != NULL) {
+		int e_mgr_id = xdb_column_int (pRes, pRow, 1);
+		int m_id     = xdb_column_int (pRes, pRow, 3);
+		ASSERT_EQ (e_mgr_id, m_id);
+		count++;
+	}
+	ASSERT_EQ (count, 3);
+	xdb_free_result (pRes);
+
+	// self-join combined with a WHERE filter on one side
+	pRes = xdb_exec (pConn, "SELECT * FROM emp AS e JOIN emp AS m ON e.mgr_id = m.id WHERE e.salary > 700");
+	ASSERT_EQ_MSG (xdb_errcode(pRes), XDB_OK, xdb_errmsg(pRes));
+	ASSERT_EQ (xdb_row_count(pRes), 2); // ids 2 and 3, both salary > 700
+	xdb_free_result (pRes);
+
+	pRes = xdb_exec (pConn, "DROP TABLE emp");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+}
+
+// T2: same JOIN as join_two_tables, but with an index on the join column,
+// to confirm an available index doesn't change correctness (it just isn't
+// used for the join scan itself yet)
+UTEST_I(XdbTest, join_indexed_column, 2)
+{
+	xdb_res_t *pRes;
+	xdb_conn_t *pConn = utest_fixture->pConn;
+
+	pRes = xdb_exec (pConn, "CREATE TABLE dept (id INT PRIMARY KEY, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "CREATE TABLE emp (id INT PRIMARY KEY, dept_id INT, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "CREATE INDEX idx_dept_id ON emp (dept_id)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+
+	pRes = xdb_exec (pConn, "INSERT INTO dept VALUES (1,100),(2,200)");
+	CHECK_AFFECT (pRes, 2);
+	pRes = xdb_exec (pConn, "INSERT INTO emp VALUES (1,1,11),(2,1,22),(3,2,33),(4,9,999)");
+	CHECK_AFFECT (pRes, 4);
+
+	pRes = xdb_exec (pConn, "SELECT * FROM dept JOIN emp ON dept.id = emp.dept_id");
+	ASSERT_EQ_MSG (xdb_errcode(pRes), XDB_OK, xdb_errmsg(pRes));
+	ASSERT_EQ (xdb_row_count(pRes), 3); // dept_id=9 has no matching dept, dept id=2 has no matching emp beyond id=3
+	xdb_free_result (pRes);
+
+	pRes = xdb_exec (pConn, "DROP TABLE emp");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "DROP TABLE dept");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+}
+
+// T3: a 3rd table's ON clause referencing the 1st table (not the immediately
+// preceding one) is rejected with a clean error, not a wrong/silent join
+UTEST_I(XdbTest, join_non_chain_rejected, 2)
+{
+	xdb_res_t *pRes;
+	xdb_conn_t *pConn = utest_fixture->pConn;
+
+	pRes = xdb_exec (pConn, "CREATE TABLE a (id INT PRIMARY KEY, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "CREATE TABLE b (id INT PRIMARY KEY, aid INT, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "CREATE TABLE c (id INT PRIMARY KEY, aid INT, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+
+	// c joins against a (the 1st table), not b (the immediately preceding one)
+	pRes = xdb_exec (pConn, "SELECT * FROM a JOIN b ON a.id = b.aid JOIN c ON a.id = c.aid");
+	ASSERT_NE (xdb_errcode(pRes), XDB_OK);
+
+	// the equivalent proper chain (c joins against b) must still work
+	pRes = xdb_exec (pConn, "CREATE TABLE d (id INT PRIMARY KEY, bid INT, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "SELECT * FROM a JOIN b ON a.id = b.aid JOIN d ON b.id = d.bid");
+	ASSERT_EQ_MSG (xdb_errcode(pRes), XDB_OK, xdb_errmsg(pRes));
+	xdb_free_result (pRes);
+
+	pRes = xdb_exec (pConn, "DROP TABLE d");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "DROP TABLE c");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "DROP TABLE b");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "DROP TABLE a");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+}
+
+// T4: WHERE on a joined (non-base) column combined with ORDER BY and LIMIT.
+// This is the row/metadata coherence check: xdb_sql_orderby/xdb_sql_limit
+// must treat each JOIN result as a whole batch of reftbl_count row pointers,
+// not a single pointer, or rows get scrambled/corrupted.
+UTEST_I(XdbTest, join_where_order_limit, 2)
+{
+	xdb_res_t *pRes;
+	xdb_row_t *pRow;
+	xdb_conn_t *pConn = utest_fixture->pConn;
+
+	pRes = xdb_exec (pConn, "CREATE TABLE t1 (id INT PRIMARY KEY, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "CREATE TABLE t2 (id INT PRIMARY KEY, t1id INT, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+
+	pRes = xdb_exec (pConn, "INSERT INTO t1 VALUES (1,100),(2,200)");
+	CHECK_AFFECT (pRes, 2);
+	pRes = xdb_exec (pConn, "INSERT INTO t2 VALUES (1,1,50),(2,1,10),(3,1,90),(4,2,30),(5,2,70)");
+	CHECK_AFFECT (pRes, 5);
+
+	// val>20 excludes t2.id=2 (val=10); remaining sorted asc by t2.val: 30,50,70,90
+	// LIMIT 2 -> t2.id=4 (val=30,t1id=2) then t2.id=1 (val=50,t1id=1)
+	pRes = xdb_exec (pConn, "SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1id WHERE t2.val > 20 ORDER BY t2.val LIMIT 2");
+	ASSERT_EQ_MSG (xdb_errcode(pRes), XDB_OK, xdb_errmsg(pRes));
+	ASSERT_EQ (xdb_row_count(pRes), 2);
+
+	pRow = xdb_fetch_row (pRes);
+	ASSERT_TRUE (pRow != NULL);
+	ASSERT_EQ (xdb_column_int (pRes, pRow, 0), 2);   // t1.id
+	ASSERT_EQ (xdb_column_int (pRes, pRow, 1), 200); // t1.val
+	ASSERT_EQ (xdb_column_int (pRes, pRow, 2), 4);   // t2.id
+	ASSERT_EQ (xdb_column_int (pRes, pRow, 3), 2);   // t2.t1id
+	ASSERT_EQ (xdb_column_int (pRes, pRow, 4), 30);  // t2.val
+
+	pRow = xdb_fetch_row (pRes);
+	ASSERT_TRUE (pRow != NULL);
+	ASSERT_EQ (xdb_column_int (pRes, pRow, 0), 1);   // t1.id
+	ASSERT_EQ (xdb_column_int (pRes, pRow, 1), 100); // t1.val
+	ASSERT_EQ (xdb_column_int (pRes, pRow, 2), 1);   // t2.id
+	ASSERT_EQ (xdb_column_int (pRes, pRow, 3), 1);   // t2.t1id
+	ASSERT_EQ (xdb_column_int (pRes, pRow, 4), 50);  // t2.val
+
+	xdb_free_result (pRes);
+
+	pRes = xdb_exec (pConn, "DROP TABLE t2");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "DROP TABLE t1");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+}
+
+// T5: an unqualified column name that exists in more than one joined table
+// must be rejected as ambiguous, not silently resolved to the wrong one
+UTEST_I(XdbTest, join_ambiguous_column, 2)
+{
+	xdb_res_t *pRes;
+	xdb_conn_t *pConn = utest_fixture->pConn;
+
+	pRes = xdb_exec (pConn, "CREATE TABLE t1 (id INT PRIMARY KEY, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "CREATE TABLE t2 (id INT PRIMARY KEY, t1id INT, val INT)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+
+	pRes = xdb_exec (pConn, "INSERT INTO t1 VALUES (1,100)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "INSERT INTO t2 VALUES (1,1,50)");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+
+	pRes = xdb_exec (pConn, "SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1id WHERE val > 20");
+	ASSERT_NE (xdb_errcode(pRes), XDB_OK);
+
+	pRes = xdb_exec (pConn, "DROP TABLE t2");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+	pRes = xdb_exec (pConn, "DROP TABLE t1");
+	ASSERT_EQ (xdb_errcode(pRes), XDB_OK);
+}
