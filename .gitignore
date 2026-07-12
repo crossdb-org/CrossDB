@@ -54,3 +54,9 @@ dkms.conf
 # Misc
 *.bin
 build/*
+test/testdb/*
+
+# Generated files
+CLAUDE.md
+AGENTS.md
+.claude/

@@ -1,5 +1,5 @@
 all:
-	$(CC) -o example.bin example.c -lcrossdb -lpthread
+	$(CC) -o example.bin example.c ../../src/crossdb.c -O2 -I../../include -lpthread
 	./example.bin
 
 debug:

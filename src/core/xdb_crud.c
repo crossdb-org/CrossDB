@@ -2272,7 +2272,7 @@ xdb_rowset_free (xdb_rowset_t *pRowSet)
 	}
 }
 
-XDB_STATIC int 
+XDB_STATIC int
 #if defined(_WIN32) || defined(__FreeBSD__) ||  defined(__APPLE__)
 xdb_sort_cmp (void *pArg, const void *pLeft, const void *pRight)
 #else
@@ -2283,30 +2283,44 @@ xdb_sort_cmp (const void *pLeft, const void *pRight, void *pArg)
 	xdb_stmt_select_t	*pStmt = pArg;
 	const xdb_rowptr_t	*pRowL = pLeft, *pRowR = pRight;
 
+	// for a JOIN, each sortable unit is a batch of reftbl_count row pointers
+	// (one per joined table, see xdb_rowset_add_batch); the order-by fields
+	// all belong to ref_tbl[order_reftbl_id] (enforced at parse time), so
+	// compare using that specific slot's row, not the batch's first pointer
+	if (xdb_unlikely (pStmt->reftbl_count > 1)) {
+		pRowL += pStmt->order_reftbl_id;
+		pRowR += pStmt->order_reftbl_id;
+	}
+
 	int count = pStmt->order_count;
 	cmp = xdb_row_cmp2 (pRowL->ptr, pRowR->ptr, pStmt->pOrderFlds, pStmt->pOrderExtr, &count);
 
 	return (pStmt->bOrderDesc[count]) ? -cmp : cmp;
 }
 
-XDB_STATIC void 
+XDB_STATIC void
 xdb_sql_orderby (xdb_stmt_select_t *pStmt, xdb_rowset_t *pRowSet)
 {
+	// a JOIN's pRowList holds reftbl_count row pointers per logical row
+	// (see xdb_rowset_add_batch); sort whole batches, not individual pointers
+	size_t batch_size = sizeof(pRowSet->pRowList[0]) * (pStmt->reftbl_count > 1 ? pStmt->reftbl_count : 1);
 #ifdef _WIN32
-	qsort_s (pRowSet->pRowList, pRowSet->count, sizeof(pRowSet->pRowList[0]), xdb_sort_cmp, pStmt);
+	qsort_s (pRowSet->pRowList, pRowSet->count, batch_size, xdb_sort_cmp, pStmt);
 #elif defined (__FreeBSD__) || defined (__APPLE__)
-	qsort_r (pRowSet->pRowList, pRowSet->count, sizeof(pRowSet->pRowList[0]), pStmt, xdb_sort_cmp);
+	qsort_r (pRowSet->pRowList, pRowSet->count, batch_size, pStmt, xdb_sort_cmp);
 #else
-	qsort_r (pRowSet->pRowList, pRowSet->count, sizeof(pRowSet->pRowList[0]), xdb_sort_cmp, pStmt);
+	qsort_r (pRowSet->pRowList, pRowSet->count, batch_size, xdb_sort_cmp, pStmt);
 #endif
 }
 
-XDB_STATIC void 
-xdb_sql_limit (xdb_rowset_t 	*pRowSet, int limit, int offset)
+XDB_STATIC void
+xdb_sql_limit (xdb_rowset_t 	*pRowSet, int limit, int offset, int reftbl_count)
 {
 	if ((XDB_MAX_ROWS == limit) && (0 == offset)) {
 		return;
 	}
+	// a JOIN's pRowList holds reftbl_count row pointers per logical row
+	int batch = reftbl_count > 1 ? reftbl_count : 1;
 	if (offset == 0) {
 		if (pRowSet->count > limit) {
 			pRowSet->count = limit;
@@ -2314,16 +2328,15 @@ xdb_sql_limit (xdb_rowset_t 	*pRowSet, int limit, int offset)
 	} else if (offset < pRowSet->count) {
 		if (pRowSet->count - offset < limit) {
 			limit = pRowSet->count - offset;
-		}		
-		memmove (pRowSet->pRowList, &pRowSet->pRowList[offset], limit * sizeof (xdb_rowptr_t));
+		}
+		memmove (pRowSet->pRowList, &pRowSet->pRowList[offset * batch], limit * batch * sizeof (xdb_rowptr_t));
 		pRowSet->count = limit;
 	} else {
 		pRowSet->count = 0;
 	}
 }
 
-#if 0
-XDB_STATIC int 
+XDB_STATIC int
 xdb_sql_query2 (xdb_conn_t *pConn, xdb_tblm_t *pTblm, xdb_rowset_t *pRowSet, xdb_singfilter_t *pFilter)
 {
 	if (pFilter->pIdxFilter) {
@@ -2346,7 +2359,6 @@ xdb_sql_query2 (xdb_conn_t *pConn, xdb_tblm_t *pTblm, xdb_rowset_t *pRowSet, xdb
 	}
 	return XDB_OK;
 }
-#endif
 
 XDB_STATIC int 
 xdb_sql_query (xdb_conn_t *pConn, xdb_tblm_t *pTblm, xdb_rowset_t *pRowSet, xdb_reftbl_t *pRefTbl)
@@ -2392,39 +2404,65 @@ match:
 	return XDB_OK;
 }
 
-XDB_STATIC int 
+XDB_STATIC int
 xdb_sql_join (xdb_stmt_select_t *pStmt, xdb_rowptr_t *pRowPtrs, int level, xdb_rowset_t *pRowSet)
 {
 	xdb_rowset_t row_set;
 	xdb_filter_t filters[XDB_MAX_MATCH_COL], *pFilers[XDB_MAX_MATCH_COL];
+	xdb_singfilter_t sigFlt;
 	xdb_rowset_init (&row_set);
 	xdb_reftbl_t		*pJoin = &pStmt->ref_tbl[level];
-	void *pRow = pRowPtrs[level].ptr;
+	// row of the previously resolved table (ref_tbl[level-1]), used to fetch the join key values
+	void *pRow = pRowPtrs[level-1].ptr;
 
 	for (int i = 0; i < pJoin->field_count; ++i) {
 		filters[i].cmp_op = XDB_TOK_EQ;
 		filters[i].pField = pJoin->pJoinField[i];
 		filters[i].val.pField  = pJoin->pField[i];
 		xdb_row_getVal (pRow, &filters[i].val);
+		filters[i].val.val_type = filters[i].val.sup_type;
 		pFilers[i] = &filters[i];
 	}
+	int flt_count = pJoin->field_count;
 
-//	xdb_sql_query (pStmt->pConn, pJoin->pRefTblm, &row_set, pFilers, pJoin->field_count, NULL);
-	(void)pFilers;
+	// a WHERE clause condition may also target this joined table directly
+	// (parsed into pJoin->or_list[0] by xdb_parse_where); fold those in too,
+	// so e.g. "... JOIN t2 ON ... WHERE t2.col > x" is actually enforced.
+	// OR-groups on a joined table (or_count > 1) aren't supported yet.
+	if ((pJoin->or_count <= 1) && (pJoin->or_list[0].filter_count > 0)) {
+		int extra = pJoin->or_list[0].filter_count;
+		if (flt_count + extra > XDB_ARY_LEN(pFilers)) {
+			extra = XDB_ARY_LEN(pFilers) - flt_count;
+		}
+		for (int i = 0; i < extra; ++i) {
+			pFilers[flt_count + i] = pJoin->or_list[0].pFilters[i];
+		}
+		flt_count += extra;
+	}
+
+	memset (&sigFlt, 0, sizeof(sigFlt));
+	if (flt_count > XDB_ARY_LEN(sigFlt.pFilters)) {
+		flt_count = XDB_ARY_LEN(sigFlt.pFilters);
+	}
+	memcpy (sigFlt.pFilters, pFilers, sizeof(pFilers[0]) * flt_count);
+	sigFlt.filter_count = flt_count;
+
+	xdb_sql_query2 (pStmt->pConn, pJoin->pRefTblm, &row_set, &sigFlt);
+
 	if (row_set.count > 0) {
 		int nxt_lvl = level + 1;
 		for (xdb_rowid id = 0; id < row_set.count; ++id) {
-			pRowPtrs[nxt_lvl] = row_set.pRowList[id];
+			// row resolved for ref_tbl[level]
+			pRowPtrs[level] = row_set.pRowList[id];
 			if (nxt_lvl == pStmt->reftbl_count) {
-				// add to row
-				for (int i = 0; i < nxt_lvl; ++i) {
-					xdb_rowset_add_batch (pRowSet, pRowPtrs, pStmt->reftbl_count + 1);
-				}
+				// full row across all joined tables resolved, add it once
+				xdb_rowset_add_batch (pRowSet, pRowPtrs, pStmt->reftbl_count);
 			} else {
 				xdb_sql_join (pStmt, pRowPtrs, nxt_lvl, pRowSet);
 			}
 		}
 	}
+	xdb_rowset_free (&row_set);
 	return 0;
 }
 
@@ -2478,7 +2516,7 @@ xdb_sql_filter (xdb_stmt_select_t *pStmt)
 	if (xdb_unlikely (pStmt->order_count > 0)) {
 		xdb_sql_orderby (pStmt, pRowSet);
 		memcpy (&pRowSet->limit, &pStmt->limit, sizeof(pRowSet->limit) * 2);
-		xdb_sql_limit (pRowSet, pStmt->limit, pStmt->offset);
+		xdb_sql_limit (pRowSet, pStmt->limit, pStmt->offset, pStmt->reftbl_count);
 	}
 
 	if (xdb_unlikely (pStmt->agg_count) > 0) {
@@ -2779,13 +2817,28 @@ xdb_sql_select (xdb_stmt_select_t *pStmt)
 				}
 			} else {
 				void *pJoinDat = (void*)pCurDat->rowdat;
+				// each joined table has its own null bitmap at the tail of its own
+				// row; merge them into the single combined null bitmap by column
+				uint8_t *pNull = (void*)pCurDat->rowdat + pStmt->pMeta->null_off;
+				XDB_BMP_INIT1 (pNull, pStmt->pMeta->col_count);
+				int gfid = 0;
 				for (int i = 0; i < pStmt->reftbl_count; ++i, ++jid) {
-					int tbl_rowsize = pStmt->ref_tbl[i].pRefTblm->row_size;
+					xdb_tblm_t *pRefTblm = pStmt->ref_tbl[i].pRefTblm;
+					int tbl_rowsize = pRefTblm->row_size;
 					void *pPtr = pRowSet->pRowList[jid].ptr;
 					if (NULL != pPtr) {
 						memcpy (pJoinDat, pPtr, tbl_rowsize);
+						uint8_t *pSrcNull = pPtr + pRefTblm->null_off;
+						for (int f = 0; f < pRefTblm->fld_count; ++f, ++gfid) {
+							if (!XDB_IS_NOTNULL (pSrcNull, f)) {
+								XDB_SET_NULL (pNull, gfid);
+							}
+						}
 					} else {
 						memset (pJoinDat, 0, tbl_rowsize);
+						for (int f = 0; f < pRefTblm->fld_count; ++f, ++gfid) {
+							XDB_SET_NULL (pNull, gfid);
+						}
 					}
 					pJoinDat += tbl_rowsize;
 				}
@@ -3122,7 +3175,14 @@ xdb_row_insert (xdb_conn_t *pConn, xdb_tblm_t *pTblm, void *pRow, bool bUpdOrRol
 
 	*(uint8_t*)(pRowDb + pTblm->vtype_off) = vtype;
 
-	if (XDB_OBJM_COUNT(pTblm->fkey_objm) > 0) {
+	if (xdb_unlikely (XDB_OBJM_COUNT(pTblm->fkey_objm) > 0)) {
+		if (XDB_OK != xdb_fkey_insert_check (pConn, pTblm, pRowDb)) {
+			xdb_stg_free (pStgMgr, rid, pRowDb);
+			if (XDB_VTYPE_OK(vtype)) {
+				xdb_vdata_free (pTblm->pVdatm, vtype, vid);
+			}
+			return -1;
+		}
 	}
 
 	if (xdb_likely (pTblm->bMemory && pConn->bAutoTrans)) {
@@ -3174,6 +3234,12 @@ __xdb_row_delete (xdb_tblm_t *pTblm, xdb_rowid rid, void *pRow)
 XDB_STATIC int 
 xdb_row_delete (xdb_conn_t *pConn, xdb_tblm_t *pTblm, xdb_rowid rid, void *pRow)
 {
+	if (xdb_unlikely (XDB_OBJM_COUNT(pTblm->fkeyref_objm) > 0)) {
+		if (XDB_OK != xdb_fkey_delete_check (pConn, pTblm, pRow)) {
+			return -1;
+		}
+	}
+
 	uint8_t ctrl = XDB_ROW_CTRL (pTblm->stg_mgr.pStgHdr, pRow) & XDB_ROW_MASK;
 
 	int			bef_trig_cnt = XDB_OBJM_COUNT(pTblm->trig_objm[XDB_TRIG_BEF_DEL]);
@@ -3250,7 +3316,7 @@ xdb_row_update (xdb_conn_t *pConn, xdb_tblm_t *pTblm, xdb_rowid rid, void *pRow,
 		XDB_EXPECT (pUpdRow != NULL, XDB_E_MEMORY, "Can't alloc memory");
 		memcpy (pUpdRow, pRow, pTblm->pMeta->row_size);
 		memset (pUpdRow + pTblm->row_size, 0, row_vlen);
-		*(pUpdRow + pTblm->vtype_off) = XDB_VTYPE_PTR;
+		*((uint8_t*)pUpdRow + pTblm->vtype_off) = XDB_VTYPE_PTR;
 		// will expand the vdata as if of the same vdata, the update will remap and addr will be invalid
 		void *pVdat = xdb_row_vdata_get2 (pTblm, pRow);
 		if (pVdat != NULL) {

@@ -12,16 +12,22 @@
 XDB_STATIC xdb_tblm_t * xdb_stmt_find_table (xdb_stmt_select_t *pStmt, const char *name, int *pRefTblId)
 {
 	for (int i = 0; i < pStmt->reftbl_count; ++i) {
-		xdb_tblm_t *pTblm = pStmt->ref_tbl[i].pRefTblm;
-		if (!strcasecmp (XDB_OBJ_NAME(pTblm), name)) {
+		xdb_reftbl_t *pRefTbl = &pStmt->ref_tbl[i];
+		// once a table has an alias, it must be referenced by that alias, not its real name
+		// (this is what lets the same table appear more than once, e.g. a self-join)
+		if (pRefTbl->as_name != NULL) {
+			if (!strcasecmp (pRefTbl->as_name, name)) {
+				*pRefTblId = i;
+				return pRefTbl->pRefTblm;
+			}
+		} else if (!strcasecmp (XDB_OBJ_NAME(pRefTbl->pRefTblm), name)) {
 			*pRefTblId = i;
-			return pTblm;
+			return pRefTbl->pRefTblm;
 		}
 	}
 	return NULL;
 }
 
-#if 0
 XDB_STATIC xdb_field_t * xdb_stmt_find_field (xdb_conn_t *pConn, xdb_stmt_select_t *pStmt, const char *name, int len, int *pRefTblId)
 {
 	xdb_field_t *pField = NULL;
@@ -30,6 +36,7 @@ XDB_STATIC xdb_field_t * xdb_stmt_find_field (xdb_conn_t *pConn, xdb_stmt_select
 		xdb_field_t *pFld = xdb_find_field (pTblm, name, len);
 		if (pFld != NULL) {
 			XDB_EXPECT (NULL == pField, XDB_E_STMT, "Column '%s' in field list is ambiguous", name);
+			pField = pFld;
 			*pRefTblId = i;
 		}
 	}
@@ -39,7 +46,6 @@ XDB_STATIC xdb_field_t * xdb_stmt_find_field (xdb_conn_t *pConn, xdb_stmt_select
 error:
 	return NULL;
 }
-#endif
 
 int 
 xdb_inet_sprintf (const xdb_inet_t *pInet, char *buf, int size)
@@ -475,25 +481,40 @@ xdb_init_where_stmt (xdb_stmt_select_t *pStmt)
 	pStmt->offset	= 0;
 }
 
-XDB_STATIC int 
+XDB_STATIC xdb_field_t* xdb_parse_tblfldname (xdb_conn_t *pConn, xdb_stmt_select_t *pStmt, xdb_token_t *pTkn, int *pRefTblId);
+
+XDB_STATIC int
 xdb_parse_orderby (xdb_conn_t* pConn, xdb_stmt_select_t *pStmt, xdb_token_t *pTkn)
 {
 	xdb_token_type type = xdb_next_token (pTkn);
-	
+
 	XDB_EXPECT ((XDB_TOK_ID == type) && !strcasecmp (pTkn->token, "BY"), XDB_E_STMT, "Expect ORDER BY");
 
 	pStmt->order_count = 0;
 	do {
 		type = xdb_next_token (pTkn);
 		if (XDB_TOK_ID == type) {
-			xdb_field_t *pField = xdb_find_field (pStmt->pTblm, pTkn->token, pTkn->tk_len);
-			XDB_EXPECT (pField != NULL, XDB_E_STMT, "Can't find field '%s'", pTkn->token);
+			int refTblId = 0;
+			// supports both a plain column name and a qualified tbl./alias.col,
+			// so ORDER BY can reference any of the joined tables, not just ref_tbl[0]
+			xdb_field_t *pField = xdb_parse_tblfldname (pConn, pStmt, pTkn, &refTblId);
+			XDB_EXPECT2 (pField != NULL);
+			if (xdb_unlikely (pStmt->reftbl_count > 1)) {
+				// the sort execution only supports all ORDER BY columns coming
+				// from the same joined table (see xdb_sort_cmp)
+				if (0 == pStmt->order_count) {
+					pStmt->order_reftbl_id = refTblId;
+				} else {
+					XDB_EXPECT (refTblId == pStmt->order_reftbl_id, XDB_E_STMT,
+						"ORDER BY columns must all come from the same joined table");
+				}
+			}
 			pStmt->pOrderFlds[pStmt->order_count] = pField;
 			pStmt->bOrderDesc[pStmt->order_count] = false;
 		} else {
 			break;
 		}
-		type = xdb_next_token (pTkn);
+		type = pTkn->tk_type;
 		if (XDB_TOK_EXTRACT == type) {
 			type = xdb_next_token (pTkn);
 			XDB_EXPECT (type <= XDB_TOK_STR, XDB_E_STMT, "Expect json extract string");
@@ -680,7 +701,7 @@ xdb_find_idx (xdb_tblm_t	*pTblm, xdb_singfilter_t *pSigFlt, uint8_t 	bmp[])
 			char *pIdxExt = pIdxm->pExtract[fid];
 			int j;
 			for (j = 0; j < pSigFlt->filter_count; ++j) {
-				if ((pSigFlt->pFilters[j]->pField->fld_id == fld_id)) {
+				if (pSigFlt->pFilters[j]->pField->fld_id == fld_id) {
 					char *pExtract = pSigFlt->pFilters[j]->pExtract;
 					if ((NULL == pIdxExt) && (NULL == pExtract)) {
 						break;
@@ -738,15 +759,28 @@ xdb_parse_where (xdb_conn_t* pConn, xdb_stmt_select_t *pStmt, xdb_token_t *pTkn)
 	char 			*pVal, *pFldName, *pTblName = NULL, *pExtract;
 	xdb_reftbl_t	*pRefTbl = &pStmt->ref_tbl[0];
 
-	pRefTbl->or_count = 1;
+	// a WHERE clause after a JOIN may target any of the ref tables (by alias);
+	// reset every table's filter/index state so an untouched table (one no
+	// condition ever references) is left as a plain full scan, not a stale
+	// bUseIdx=true with no actual index filter behind it.
+	// DELETE/UPDATE don't run the SELECT FROM-clause loop, so reftbl_count is
+	// still 0 for them here even though ref_tbl[0] is the (implicit) target
+	// table - always reset at least that one slot.
+	int nRefTbl = pStmt->reftbl_count > 0 ? pStmt->reftbl_count : 1;
+	for (int t = 0; t < nRefTbl; ++t) {
+		pStmt->ref_tbl[t].bUseIdx = false;
+		pStmt->ref_tbl[t].filter_count = 0;
+		pStmt->ref_tbl[t].or_count = 1;
+		pStmt->ref_tbl[t].or_list[0].filter_count = 0;
+	}
 	xdb_singfilter_t	*pSigFlt = &pRefTbl->or_list[0];
-	pSigFlt->filter_count = 0;
 
 	pRefTbl->bUseIdx = true;
 
 	do {
 next_filter:
 		pExtract = NULL;
+		i = 0; // reset: an unqualified field always targets ref_tbl[0], regardless of the previous condition's table
 		type = xdb_next_token (pTkn);
 		if (xdb_likely (XDB_TOK_ID == type)) {
 			pFldName = pTkn->token;
@@ -797,26 +831,39 @@ next_filter:
 		if (pTblName == NULL) {
 			pField = xdb_find_field (pStmt->pTblm, pFldName, flen);
 			for (int i = 1; i < pStmt->reftbl_count; ++i) {
-				xdb_field_t *pField2 = xdb_find_field (pRefTbl[i].pRefTblm, pFldName, flen);
+				xdb_field_t *pField2 = xdb_find_field (pStmt->ref_tbl[i].pRefTblm, pFldName, flen);
 				XDB_EXPECT (NULL == pField2, XDB_E_STMT, "Ambiguous field '%s'", pFldName);
 			}
 		} else {
 			for (i = 0; i < pStmt->reftbl_count; ++i) {
-				if (pRefTbl[i].as_name) {
-					if (!strcasecmp(pRefTbl[i].as_name, pTblName)) {
+				if (pStmt->ref_tbl[i].as_name) {
+					if (!strcasecmp(pStmt->ref_tbl[i].as_name, pTblName)) {
 						break;
 					}
-				} else if (!strcasecmp(XDB_OBJ_NAME(pRefTbl[i].pRefTblm), pTblName)) {
+				} else if (!strcasecmp(XDB_OBJ_NAME(pStmt->ref_tbl[i].pRefTblm), pTblName)) {
 					break;
 				}
 			}
 			XDB_EXPECT (i < pStmt->reftbl_count, XDB_E_STMT, "No join table '%s'", pTblName);
-			pField = xdb_find_field (pRefTbl[i].pRefTblm, pFldName, flen);
+			pField = xdb_find_field (pStmt->ref_tbl[i].pRefTblm, pFldName, flen);
 		}
 		XDB_EXPECT (pField != NULL, XDB_E_STMT, "Can't find field '%s'", pFldName);
-		if (xdb_unlikely (i > 0)) {
-			pRefTbl = &pRefTbl[i];
-			pTblm = pRefTbl->pRefTblm;
+		{
+			xdb_reftbl_t *pTargetTbl = (i > 0) ? &pStmt->ref_tbl[i] : &pStmt->ref_tbl[0];
+			if (xdb_unlikely (pTargetTbl != pRefTbl)) {
+				// switching to a different (joined) table's filter group:
+				// finalize the one we were building before starting a fresh one
+				if (pRefTbl->bUseIdx) {
+					pRefTbl->bUseIdx = xdb_find_idx (pTblm, pSigFlt, bmp);
+				}
+				memset (bmp, 0, sizeof(bmp));
+				pRefTbl = pTargetTbl;
+				pTblm = pRefTbl->pRefTblm;
+				pSigFlt = &pRefTbl->or_list[pRefTbl->or_count - 1];
+				if (0 == pRefTbl->filter_count) {
+					pRefTbl->bUseIdx = true;
+				}
+			}
 		}
 		xdb_filter_t *pFilter = &pRefTbl->filters[pRefTbl->filter_count++];
 		pSigFlt->pFilters[pSigFlt->filter_count++] = pFilter;
@@ -1168,14 +1215,13 @@ error:
 	return -1;
 }
 
-#if 0
-XDB_STATIC xdb_field_t* 
+XDB_STATIC xdb_field_t*
 xdb_parse_tblfldname (xdb_conn_t *pConn, xdb_stmt_select_t *pStmt, xdb_token_t *pTkn, int *pRefTblId)
 {
 	char 	*fld_name = pTkn->token;
 	int		len = pTkn->tk_len;
 	int 	type = xdb_next_token (pTkn);
-	
+
 	if (XDB_TOK_DOT == type) {
 		xdb_tblm_t *pTblm = xdb_stmt_find_table (pStmt, fld_name, pRefTblId);
 		XDB_EXPECT (NULL != pTblm, XDB_E_NOTFOUND, "Table '%s' doesn't exist", fld_name);
@@ -1194,7 +1240,6 @@ xdb_parse_tblfldname (xdb_conn_t *pConn, xdb_stmt_select_t *pStmt, xdb_token_t *
 error:
 	return NULL;
 }
-#endif
 
 XDB_STATIC xdb_stmt_t* 
 xdb_parse_select (xdb_conn_t* pConn, xdb_token_t *pTkn, bool bPStmt)
@@ -1331,7 +1376,15 @@ xdb_parse_select (xdb_conn_t* pConn, xdb_token_t *pTkn, bool bPStmt)
 		XDB_EXPECT (type <= XDB_TOK_STR, XDB_E_STMT, "Miss table name");
 		// [db_name.]tbl_name
 		XDB_PARSE_DBTBLNAME();
-		pStmt->ref_tbl[pStmt->reftbl_count++].pRefTblm = pStmt->pTblm;
+		xdb_reftbl_t *pFromTbl = &pStmt->ref_tbl[pStmt->reftbl_count++];
+		pFromTbl->pRefTblm = pStmt->pTblm;
+		pFromTbl->as_name = NULL;
+		if ((XDB_TOK_ID == type) && !strcasecmp (pTkn->token, "AS")) {
+			type = xdb_next_token (pTkn);
+			XDB_EXPECT (XDB_TOK_ID == type, XDB_E_STMT, "Except alias name");
+			pFromTbl->as_name = pTkn->token;
+			type = xdb_next_token (pTkn);
+		}
 	} while (XDB_TOK_COMMA == type);
 
 	while ((XDB_TOK_ID == type) && !strcasecmp (pTkn->token, "JOIN")) {
@@ -1340,30 +1393,53 @@ xdb_parse_select (xdb_conn_t* pConn, xdb_token_t *pTkn, bool bPStmt)
 		pRefTbl->join_type = XDB_JOIN_INNER;
 		pRefTbl->pRefTblm = xdb_parse_dbtblname (pConn, pTkn);
 		XDB_EXPECT2 (pRefTbl->pRefTblm != NULL);
+		pRefTbl->as_name = NULL;
+		if ((XDB_TOK_ID == pTkn->tk_type) && !strcasecmp (pTkn->token, "AS")) {
+			int aliasType = xdb_next_token (pTkn);
+			XDB_EXPECT (XDB_TOK_ID == aliasType, XDB_E_STMT, "Except alias name");
+			pRefTbl->as_name = pTkn->token;
+			xdb_next_token (pTkn);
+		}
 		XDB_EXPECT ((XDB_TOK_ID == pTkn->tk_type) && !strcasecmp (pTkn->token, "ON"), XDB_E_STMT, "Except JOIN ON");
 		pRefTbl->field_count = 0;
 
 		pStmt->reftbl_count++;
 
-		type = xdb_parse_where (pConn, pStmt, pTkn);
-		XDB_EXPECT2 (type >= 0);
+		{
+			int joinTblId = pStmt->reftbl_count - 1;
+			int prevTblId = pStmt->reftbl_count - 2;
+			do {
+				type = xdb_next_token (pTkn);
+				XDB_EXPECT (XDB_TOK_ID == type, XDB_E_STMT, "Except field name");
+				XDB_EXPECT (pRefTbl->field_count < XDB_MAX_MATCH_COL/4, XDB_E_STMT, "Too many JOIN ON conditions");
+				int refTblId1 = -1;
+				xdb_field_t *pField1 = xdb_parse_tblfldname (pConn, pStmt, pTkn, &refTblId1);
+				XDB_EXPECT2 (pField1 != NULL);
+				XDB_EXPECT (XDB_TOK_EQ == pTkn->tk_type, XDB_E_STMT, "Except =");
+				type = xdb_next_token (pTkn);
+				XDB_EXPECT (XDB_TOK_ID == type, XDB_E_STMT, "Except field name");
+				int refTblId2 = -1;
+				xdb_field_t *pField2 = xdb_parse_tblfldname (pConn, pStmt, pTkn, &refTblId2);
+				XDB_EXPECT2 (pField2 != NULL);
+				type = pTkn->tk_type;
 
-#if 0
-		do {
-			type = xdb_next_token (pTkn);
-			XDB_EXPECT (XDB_TOK_ID == type, XDB_E_STMT, "Except field name");
-			xdb_field_t *pField = xdb_parse_tblfldname (pConn, pStmt, pTkn);
-			XDB_EXPECT2 (pField != NULL);
-			pRefTbl->pField[pRefTbl->field_count] = pField;
-			XDB_EXPECT (XDB_TOK_EQ == pTkn->tk_type, XDB_E_STMT, "Except =");
-			type = xdb_next_token (pTkn);
-			pField = xdb_parse_tblfldname (pConn, pRefTbl->pRefTblm, pTkn);
-			XDB_EXPECT2 (pField != NULL);
-			type = pTkn->tk_type;
-			pRefTbl->pJoinField[pRefTbl->field_count] = pField;
-			pRefTbl->field_count++;
-		} while ((XDB_TOK_ID == type) && !strcasecmp (pTkn->token, "AND"));
-#endif
+				// one side must be the table just introduced by this JOIN, the other
+				// must be the immediately preceding table in the FROM/JOIN chain
+				xdb_field_t *pOuterField, *pInnerField;
+				if (refTblId1 == joinTblId) {
+					XDB_EXPECT (refTblId2 == prevTblId, XDB_E_STMT, "JOIN ON condition must reference the preceding table");
+					pInnerField = pField1;
+					pOuterField = pField2;
+				} else {
+					XDB_EXPECT ((refTblId1 == prevTblId) && (refTblId2 == joinTblId), XDB_E_STMT, "JOIN ON condition must reference the preceding table");
+					pInnerField = pField2;
+					pOuterField = pField1;
+				}
+				pRefTbl->pField[pRefTbl->field_count] = pOuterField;
+				pRefTbl->pJoinField[pRefTbl->field_count] = pInnerField;
+				pRefTbl->field_count++;
+			} while ((XDB_TOK_ID == type) && !strcasecmp (pTkn->token, "AND"));
+		}
 
 	}
 
@@ -1378,46 +1454,55 @@ xdb_parse_select (xdb_conn_t* pConn, xdb_token_t *pTkn, bool bPStmt)
 			meta_size = 0;
 			for (int jt = 0; jt < pStmt->reftbl_count; ++jt) {
 				xdb_reftbl_t *pJoin = &pStmt->ref_tbl[jt];
+				// variable-length columns (VARCHAR/VARBINARY/JSON) from joined tables
+				// aren't supported yet: their result-buffer layout assumes a single
+				// source table's vdata blob, which JOIN'd rows don't have
+				XDB_EXPECT (NULL == pJoin->pRefTblm->pVdatm, XDB_E_STMT,
+					"JOIN doesn't support VARCHAR/VARBINARY/JSON columns in '%s' yet", XDB_OBJ_NAME(pJoin->pRefTblm));
 				pStmt->col_count += pJoin->pRefTblm->fld_count;
 				row_size += pJoin->pRefTblm->row_size;
-				meta_size += pJoin->pRefTblm->meta_size - sizeof(xdb_meta_t) - 4;
+				// column entries for this table start at cols_off (past the header
+				// and the db.table name string), not right after the header
+				meta_size += pJoin->pRefTblm->meta_size - pJoin->pRefTblm->pMeta->cols_off;
 //xdb_dbgprint ("%s col %d row size %d meta len %d\n", XDB_OBJ_NAME(pJoin->pRefTblm), pJoin->pRefTblm->fld_count, pJoin->pRefTblm->row_size, pJoin->pRefTblm->meta_size);
 			}
 			meta_size += 4;
 			meta_size = XDB_ALIGN8 (meta_size);
-			if (meta_size + pStmt->col_count * 8 <= sizeof (pStmt->set_flds)) {
+			// meta_size so far is just the concatenated column entries;
+			// the combined meta blob also needs the xdb_meta_t header in front
+			int total_size = meta_size + sizeof (xdb_meta_t);
+			if (total_size + pStmt->col_count * 8 <= sizeof (pStmt->set_flds)) {
 				pStmt->pMeta = (void*)pStmt->set_flds;
 			} else {
-				pStmt->pMeta	= xdb_malloc (meta_size + pStmt->col_count * 8);
+				pStmt->pMeta	= xdb_malloc (total_size + pStmt->col_count * 8);
 				XDB_EXPECT (pStmt->pMeta, XDB_E_MEMORY, "Can't alloc memory");
-				pStmt->meta_size = meta_size; // alloc
+				pStmt->meta_size = total_size; // alloc
 			}
 			xdb_col_t *pCol = (xdb_col_t*)(pStmt->pMeta + 1);
-			uint64_t *pColList = (void*)pStmt->pMeta + meta_size;
+			uint64_t *pColList = (void*)pStmt->pMeta + total_size;
 
 			int fld_count = 0, row_offset = 0;
 			void *pJoinMeta = (xdb_col_t*)(pStmt->pMeta + 1);
 
 			for (int jt = 0; jt < pStmt->reftbl_count; ++jt) {
 				xdb_reftbl_t *pJoin = &pStmt->ref_tbl[jt];
-				int meta_len = pJoin->pRefTblm->meta_size - sizeof(xdb_meta_t) - 4; // last 4B is 0 eof
-				memcpy (pJoinMeta, pJoin->pRefTblm->pMeta + 1, meta_len);
+				int meta_len = pJoin->pRefTblm->meta_size - pJoin->pRefTblm->pMeta->cols_off;
+				memcpy (pJoinMeta, (void*)pJoin->pRefTblm->pMeta + pJoin->pRefTblm->pMeta->cols_off, meta_len);
 				pJoinMeta += meta_len;
 
-				if (row_offset) {
-					// adjust offset
-					for (int i = 0; i < pJoin->pRefTblm->fld_count; ++i) {
-						pColList[fld_count++] = (uintptr_t)pCol;
-						pCol->col_off += row_offset;
-						pCol = (void*)pCol + pCol->col_len;
-					}
+				// build the combined column list and adjust each column's offset
+				// to account for the preceding joined tables' row data
+				for (int i = 0; i < pJoin->pRefTblm->fld_count; ++i) {
+					pColList[fld_count++] = (uintptr_t)pCol;
+					pCol->col_off += row_offset;
+					pCol = (void*)pCol + pCol->col_len;
 				}
 				row_offset += pJoin->pRefTblm->row_size;
 			}
 			*(int*)pCol = 0; // eof
 
 //xdb_dbgprint ("col %d row size %d meta len %d colptr %p %p %d\n", pStmt->col_count, row_size, meta_size, pColList, pCol, (int)((void*)pCol-(void*)pStmt->pMeta));
-			pStmt->pMeta->len_type = meta_size | (XDB_RET_META<<28);
+			pStmt->pMeta->len_type = total_size | (XDB_RET_META<<28);
 			pStmt->pMeta->col_count = pStmt->col_count;
 			pStmt->pMeta->null_off = row_size;
 			row_size += ((pStmt->pMeta->col_count+7)>>3) + 2;

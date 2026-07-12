@@ -1,9 +1,17 @@
+# Override to install without root, e.g.: make install PREFIX=$$HOME/.local
+PREFIX ?= /usr/local
+BINDIR := $(PREFIX)/bin
+LIBDIR := $(PREFIX)/lib
+INCDIR := $(PREFIX)/include
+
 help:
 	@echo "make build                Build crossdb library and tool"
 	@echo "make debug                Build crossdb library and tool with debug"
 	@echo "make run                  Run crossdb tool"
 	@echo "make clean                Clean build result"
 	@echo "make install              Install crossdb(lib&tool&header) to Linux/MacOS/FreeBSD"
+	@echo "                          set PREFIX to install without root, e.g."
+	@echo "                          make install PREFIX=\$$HOME/.local"
 	@echo "make uninstall            Uninstall crossdb from Linux/MacOS/FreeBSD"
 	@echo "make example              Build and run example (need to install crossdb first)"
 	@echo "make smoketest            Build and run smoke test (need to install crossdb first)"
@@ -46,17 +54,18 @@ gdb:
 	gdb build/xdb-cli
 
 install:
-	@mkdir -p /usr/local/lib/
-	@mkdir -p /usr/local/bin/
-	install -c build/xdb-cli /usr/local/bin/
+	@mkdir -p $(LIBDIR)/
+	@mkdir -p $(BINDIR)/
+	@mkdir -p $(INCDIR)/
+	install -c build/xdb-cli $(BINDIR)/
+	install -c build/crossdb.h $(INCDIR)/
 ifeq ($(shell uname -s), Darwin)
-	$(CC) -o /usr/local/lib/libcrossdb.dylib -dynamiclib -lpthread -O2 src/crossdb.c
-	install -c build/crossdb.h $(shell xcrun --show-sdk-path)/usr/include
+	$(CC) -o $(LIBDIR)/libcrossdb.dylib -dynamiclib -lpthread -O2 src/crossdb.c
 else
-	@mkdir -p /usr/local/include/
-	install -c build/crossdb.h /usr/local/include/
-	install -c build/libcrossdb.so /usr/local/lib/
+	install -c build/libcrossdb.so $(LIBDIR)/
+ifeq ($(PREFIX), /usr/local)
 	ldconfig
+endif
 endif
 
 winpack:
@@ -68,13 +77,12 @@ winpack:
 	cp build/libcrossdb.dll build/libcrossdb.lib build/crossdb-win64/lib
 
 uninstall:
-	rm -rf /usr/local/bin/xdb-cli
+	rm -rf $(BINDIR)/xdb-cli
+	rm -rf $(INCDIR)/crossdb.h
 ifeq ($(shell uname -s), Darwin)
-	rm -rf /usr/local/lib/libcrossdb.dylib
-	rm -rf $(shell xcrun --show-sdk-path)/usr/include/crossdb.h
+	rm -rf $(LIBDIR)/libcrossdb.dylib
 else
-	rm -rf /usr/local/lib/libcrossdb.so
-	rm -rf /usr/local/include/crossdb.h
+	rm -rf $(LIBDIR)/libcrossdb.so
 endif
 
 example:

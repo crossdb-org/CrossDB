@@ -421,6 +421,9 @@ typedef struct {
 	xdb_field_t		*pOrderFlds[XDB_MAX_MATCH_COL];
 	char			*pOrderExtr[XDB_MAX_MATCH_COL];
 	bool			bOrderDesc[XDB_MAX_MATCH_COL];
+	// which ref_tbl[] slot the order-by fields belong to (only meaningful
+	// when reftbl_count > 1: all order-by fields must be from the same table)
+	uint8_t			order_reftbl_id;
 
 	// limit
 	xdb_rowid		limit;

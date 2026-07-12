@@ -19,8 +19,11 @@ typedef struct xdb_fkeym_t {
 	int				fld_count;
 	xdb_fkey_action	on_del_act;
 	xdb_fkey_action	on_upd_act;
-	//xdb_field_t		*pFields[XDB_MAX_MATCH_COL];
+	xdb_filter_t		fkey_filters[XDB_MAX_MATCH_COL];
 	xdb_singfilter_t	filter;
 } xdb_fkeym_t;
+
+XDB_STATIC int xdb_fkey_insert_check (xdb_conn_t *pConn, struct xdb_tblm_t *pTblm, void *pRow);
+XDB_STATIC int xdb_fkey_delete_check (xdb_conn_t *pConn, struct xdb_tblm_t *pTblm, void *pRow);
 
 #endif // __XDB_FKEY_H__
