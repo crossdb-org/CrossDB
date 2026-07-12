@@ -701,7 +701,7 @@ xdb_find_idx (xdb_tblm_t	*pTblm, xdb_singfilter_t *pSigFlt, uint8_t 	bmp[])
 			char *pIdxExt = pIdxm->pExtract[fid];
 			int j;
 			for (j = 0; j < pSigFlt->filter_count; ++j) {
-				if ((pSigFlt->pFilters[j]->pField->fld_id == fld_id)) {
+				if (pSigFlt->pFilters[j]->pField->fld_id == fld_id) {
 					char *pExtract = pSigFlt->pFilters[j]->pExtract;
 					if ((NULL == pIdxExt) && (NULL == pExtract)) {
 						break;

@@ -132,7 +132,7 @@ xdb_fetch_res_sock (xdb_conn_t *pConn)
 				return NULL;
 			}
 		}
-		xdb_svrlog ("get response %d from server\n", sizeof(*pRes) + pRes->data_len);
+		xdb_svrlog ("get response %"PRIu64" from server\n", (uint64_t)(sizeof(*pRes) + pRes->data_len));
 #if XDB_LOG_FLAGS & XDB_LOG_SVR
 		//xdb_hexdump (pRes, sizeof(*pRes) + pRes->data_len);
 #endif

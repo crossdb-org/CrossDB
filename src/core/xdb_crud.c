@@ -3316,7 +3316,7 @@ xdb_row_update (xdb_conn_t *pConn, xdb_tblm_t *pTblm, xdb_rowid rid, void *pRow,
 		XDB_EXPECT (pUpdRow != NULL, XDB_E_MEMORY, "Can't alloc memory");
 		memcpy (pUpdRow, pRow, pTblm->pMeta->row_size);
 		memset (pUpdRow + pTblm->row_size, 0, row_vlen);
-		*(pUpdRow + pTblm->vtype_off) = XDB_VTYPE_PTR;
+		*((uint8_t*)pUpdRow + pTblm->vtype_off) = XDB_VTYPE_PTR;
 		// will expand the vdata as if of the same vdata, the update will remap and addr will be invalid
 		void *pVdat = xdb_row_vdata_get2 (pTblm, pRow);
 		if (pVdat != NULL) {

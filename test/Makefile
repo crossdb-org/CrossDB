@@ -1,5 +1,5 @@
 all:
-	$(CC) -o xdb_smoke_test.bin xdb_smoke_test.c -O2 -lcrossdb -lpthread 
+	$(CC) -o xdb_smoke_test.bin xdb_smoke_test.c ../src/crossdb.c -O2 -I../include -lpthread
 	./xdb_smoke_test.bin
 
 debug:

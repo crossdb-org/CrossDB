@@ -54,3 +54,7 @@ dkms.conf
 # Misc
 *.bin
 build/*
+
+# Generated files
+CLAUDE.md
+.claude/
